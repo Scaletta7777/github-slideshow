@@ -63,6 +63,13 @@ AI_INFOGRAPHIC_PROMPT = (
     "Features:\n{features}"
 )
 
+EDIT_PROMPT = (
+    "Edit this product photo according to the request below. Change only what is asked; keep the product itself "
+    "exactly the same (shape, colors, materials, logos, labels, printed text) unless the request is explicitly "
+    "about the product, and keep the rest of the composition, lighting and quality.\n"
+    "Request: {request}"
+)
+
 
 def build_prompt(concept_key: str | None, custom_scene: str | None = None) -> str:
     scene = custom_scene if custom_scene else CONCEPTS[concept_key][1]

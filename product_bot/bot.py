@@ -8,14 +8,21 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, Message, TelegramObject
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InputMediaPhoto,
+    Message,
+    TelegramObject,
+)
 from aiogram.utils.chat_action import ChatActionSender
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from openai import OpenAIError
 from PIL import Image
 
 import infographic
-from concepts import AI_INFOGRAPHIC_PROMPT, CONCEPTS, build_prompt
+from concepts import AI_INFOGRAPHIC_PROMPT, CONCEPTS, EDIT_PROMPT, build_prompt
 from config import load_config
 from generator import ASPECTS, ImageGenerator, prepare_input, to_jpeg
 
@@ -31,6 +38,10 @@ busy: set[int] = set()
 class Flow(StatesGroup):
     custom_scene = State()
     infographic_text = State()
+    edit_text = State()
+
+
+VARIANT_CHOICES = (1, 2, 4)
 
 
 # ---------- доступ только для своих ----------
@@ -53,24 +64,32 @@ async def only_allowed(handler, event: TelegramObject, data: dict):
 
 # ---------- клавиатуры ----------
 
-def concepts_kb(aspect: str):
+def _next(options, current):
+    options = list(options)
+    return options[(options.index(current) + 1) % len(options)] if current in options else options[0]
+
+
+def concepts_kb(aspect: str, variants: int):
     kb = InlineKeyboardBuilder()
     for key, (title, _) in CONCEPTS.items():
         kb.button(text=title, callback_data=f"c:{key}")
     kb.button(text="✍️ Свой сценарий", callback_data="custom")
     kb.adjust(2)
-    nxt = list(ASPECTS)[(list(ASPECTS).index(aspect) + 1) % len(ASPECTS)]
-    kb.row(InlineKeyboardButton(text=f"Формат: {aspect}  →  {nxt}", callback_data=f"a:{nxt}"))
+    kb.row(
+        InlineKeyboardButton(text=f"📐 Формат: {aspect}", callback_data=f"a:{_next(ASPECTS, aspect)}"),
+        InlineKeyboardButton(text=f"🔢 Вариантов: {variants}", callback_data=f"v:{_next(VARIANT_CHOICES, variants)}"),
+    )
     return kb.as_markup()
 
 
 def result_kb():
     kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Доработать", callback_data="edit")
     kb.button(text="🔁 Ещё вариант", callback_data="again")
-    kb.button(text="🎨 Другой концепт", callback_data="concepts")
     kb.button(text="🅰️ Инфографика (точный текст)", callback_data="info:tpl")
     kb.button(text="✨ Инфографика (ИИ-дизайн)", callback_data="info:ai")
-    kb.adjust(2, 1, 1)
+    kb.button(text="🎨 Другой концепт", callback_data="concepts")
+    kb.adjust(2, 1, 1, 1)
     return kb.as_markup()
 
 
@@ -82,21 +101,27 @@ async def download(bot: Bot, file_id: str) -> bytes:
     return buf.getvalue()
 
 
-async def send_result(message: Message, state: FSMContext, img: Image.Image, caption: str,
-                      clean: bool = True) -> None:
-    data = to_jpeg(img)
-    await message.answer_photo(BufferedInputFile(data, "card.jpg"), caption=caption)
-    doc = await message.answer_document(
-        BufferedInputFile(data, "card.jpg"), caption="Файл в полном качестве", reply_markup=result_kb()
-    )
-    if clean:  # инфографику всегда кладём на последнее «чистое» фото, без текста
-        await state.update_data(result_id=doc.document.file_id)
+async def send_results(message: Message, images: list[Image.Image], caption: str) -> None:
+    """Превью фото + файл в полном качестве с кнопками. Кнопки работают с файлом, к которому прикреплены."""
+    files = [to_jpeg(img) for img in images]
+    if len(files) == 1:
+        await message.answer_photo(BufferedInputFile(files[0], "card.jpg"), caption=caption)
+    else:
+        await message.answer_media_group([
+            InputMediaPhoto(media=BufferedInputFile(f, f"card_{i}.jpg"), caption=caption if i == 1 else None)
+            for i, f in enumerate(files, 1)
+        ])
+    for i, f in enumerate(files, 1):
+        label = f"Вариант {i} — файл в полном качестве" if len(files) > 1 else "Файл в полном качестве"
+        await message.answer_document(BufferedInputFile(f, f"card_{i}.jpg"), caption=label, reply_markup=result_kb())
 
 
 async def run_generation(message: Message, state: FSMContext, user_id: int, prompt: str, caption: str,
-                         source_key: str = "src_id", clean: bool = True) -> None:
+                         file_id: str | None = None, variants: int | None = None) -> None:
+    """file_id — исходник (по умолчанию загруженное фото товара); variants — сколько картинок сгенерировать."""
     data = await state.get_data()
-    file_id = data.get(source_key)
+    file_id = file_id or data.get("src_id")
+    variants = variants or data.get("variants", 1)
     if not file_id:
         await message.answer("Сначала пришлите фото товара 📷")
         return
@@ -105,12 +130,14 @@ async def run_generation(message: Message, state: FSMContext, user_id: int, prom
         return
     busy.add(user_id)
     aspect = data.get("aspect", "3:4")
-    status = await message.answer("⏳ Генерирую, обычно это 30–90 секунд…")
+    status = await message.answer(
+        "⏳ Генерирую" + (f" {variants} варианта" if variants > 1 else "") + ", обычно это 30–90 секунд…"
+    )
     try:
         async with ChatActionSender.upload_photo(bot=message.bot, chat_id=message.chat.id):
             raw = prepare_input(await download(message.bot, file_id))
-            img = await generator.edit(raw, prompt, aspect)
-        await send_result(message, state, img, caption, clean)
+            images = await generator.edit(raw, prompt, aspect, n=variants)
+        await send_results(message, images, caption)
     except OpenAIError as e:
         log.exception("OpenAI error")
         await message.answer(f"❌ Ошибка OpenAI: {e}")
@@ -143,10 +170,10 @@ async def start(message: Message, state: FSMContext) -> None:
 async def got_photo(message: Message, state: FSMContext) -> None:
     file_id = message.photo[-1].file_id if message.photo else message.document.file_id
     data = await state.get_data()
-    aspect = data.get("aspect", "3:4")
+    aspect, variants = data.get("aspect", "3:4"), data.get("variants", 1)
     await state.set_state(None)
-    await state.update_data(src_id=file_id, aspect=aspect, result_id=None)
-    await message.answer("Выберите концепт съёмки:", reply_markup=concepts_kb(aspect))
+    await state.update_data(src_id=file_id, aspect=aspect, variants=variants)
+    await message.answer("Выберите концепт съёмки:", reply_markup=concepts_kb(aspect, variants))
 
 
 # ---------- выбор концепта ----------
@@ -155,14 +182,26 @@ async def got_photo(message: Message, state: FSMContext) -> None:
 async def toggle_aspect(call: CallbackQuery, state: FSMContext) -> None:
     aspect = call.data[2:]
     await state.update_data(aspect=aspect)
-    await call.message.edit_reply_markup(reply_markup=concepts_kb(aspect))
+    data = await state.get_data()
+    await call.message.edit_reply_markup(reply_markup=concepts_kb(aspect, data.get("variants", 1)))
     await call.answer(f"Формат {aspect}")
+
+
+@router.callback_query(F.data.startswith("v:"))
+async def toggle_variants(call: CallbackQuery, state: FSMContext) -> None:
+    variants = int(call.data[2:])
+    await state.update_data(variants=variants)
+    data = await state.get_data()
+    await call.message.edit_reply_markup(reply_markup=concepts_kb(data.get("aspect", "3:4"), variants))
+    await call.answer(f"Вариантов за раз: {variants}")
 
 
 @router.callback_query(F.data == "concepts")
 async def show_concepts(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
-    await call.message.answer("Выберите концепт съёмки:", reply_markup=concepts_kb(data.get("aspect", "3:4")))
+    await call.message.answer(
+        "Выберите концепт съёмки:", reply_markup=concepts_kb(data.get("aspect", "3:4"), data.get("variants", 1))
+    )
     await call.answer()
 
 
@@ -203,7 +242,7 @@ async def again(call: CallbackQuery, state: FSMContext) -> None:
     if not data.get("prompt"):
         await call.message.answer("Сначала выберите концепт.")
         return
-    await run_generation(call.message, state, call.from_user.id, data["prompt"], data.get("caption", ""))
+    await run_generation(call.message, state, call.from_user.id, data["prompt"], data.get("caption", ""), variants=1)
 
 
 # ---------- инфографика ----------
@@ -212,7 +251,7 @@ async def again(call: CallbackQuery, state: FSMContext) -> None:
 async def ask_infographic(call: CallbackQuery, state: FSMContext) -> None:
     mode = call.data.split(":", 1)[1]
     await state.set_state(Flow.infographic_text)
-    await state.update_data(info_mode=mode, info_base=(await state.get_data()).get("result_id"))
+    await state.update_data(info_mode=mode, info_base=call.message.document.file_id)
     await call.message.answer(
         "Пришлите текст для карточки. <b>Первая строка — заголовок</b>, остальные — преимущества "
         f"(до {infographic.MAX_FEATURES}), например:\n\n"
@@ -235,14 +274,36 @@ async def got_infographic(message: Message, state: FSMContext) -> None:
             title=title, features="\n".join(f"- {f}" for f in features) or "-"
         )
         await run_generation(message, state, message.from_user.id, prompt, "✨ Инфографика (ИИ)",
-                             source_key="info_base", clean=False)
+                             file_id=data["info_base"], variants=1)
         return
 
     raw = await download(message.bot, data["info_base"])
     img = await asyncio.to_thread(
         infographic.render, Image.open(io.BytesIO(raw)), message.text, config.font_path
     )
-    await send_result(message, state, img, "🅰️ Инфографика", clean=False)
+    await send_results(message, [img], "🅰️ Инфографика")
+
+
+# ---------- доработка текстом ----------
+
+@router.callback_query(F.data == "edit")
+async def ask_edit(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(Flow.edit_text)
+    await state.update_data(edit_base=call.message.document.file_id)
+    await call.message.answer(
+        "Что изменить? Например:\n"
+        "<i>сделай фон светлее</i>, <i>убери тень</i>, <i>добавь веточку эвкалипта слева</i>, "
+        "<i>поверни товар чуть боком</i>"
+    )
+    await call.answer()
+
+
+@router.message(Flow.edit_text, F.text)
+async def got_edit(message: Message, state: FSMContext) -> None:
+    await state.set_state(None)
+    data = await state.get_data()
+    await run_generation(message, state, message.from_user.id, EDIT_PROMPT.format(request=message.text),
+                         "✏️ Доработка", file_id=data.get("edit_base"), variants=1)
 
 
 @router.message()

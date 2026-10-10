@@ -71,7 +71,7 @@ class ImageGenerator:
         self.model = model
         self.quality = quality
 
-    async def edit(self, image_png: bytes, prompt: str, aspect: str) -> Image.Image:
+    async def edit(self, image_png: bytes, prompt: str, aspect: str, n: int = 1) -> list[Image.Image]:
         extra = {"input_fidelity": "high"} if _supports_input_fidelity(self.model) else {}
         result = await self.client.images.edit(
             model=self.model,
@@ -80,9 +80,12 @@ class ImageGenerator:
             size=_request_size(self.model, aspect),
             quality=self.quality,
             output_format="png",
-            n=1,
+            n=n,
             **extra,
         )
-        img = Image.open(io.BytesIO(base64.b64decode(result.data[0].b64_json)))
-        img.load()
-        return _fit_aspect(img, aspect)
+        images = []
+        for item in result.data:
+            img = Image.open(io.BytesIO(base64.b64decode(item.b64_json)))
+            img.load()
+            images.append(_fit_aspect(img, aspect))
+        return images
