@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -21,10 +22,15 @@ class Config:
 
 
 def load_config() -> Config:
-    token = os.getenv("BOT_TOKEN", "").strip()
-    key = os.getenv("OPENAI_API_KEY", "").strip()
+    token = os.getenv("BOT_TOKEN", "").strip().strip("\"'«»“”")
+    key = os.getenv("OPENAI_API_KEY", "").strip().strip("\"'«»“”")
     if not token or not key:
         raise SystemExit("Заполните BOT_TOKEN и OPENAI_API_KEY в файле .env (см. .env.example)")
+    if not re.fullmatch(r"\d{5,}:[\w-]{30,}", token) or token.startswith("123456789:"):
+        raise SystemExit(
+            "BOT_TOKEN в файле .env выглядит неправильно. Он должен быть вида 7712345678:AAH... "
+            "Скопируйте его заново в @BotFather: /mybots → ваш бот → API Token."
+        )
     return Config(
         bot_token=token,
         openai_api_key=key,

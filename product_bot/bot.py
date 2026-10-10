@@ -5,6 +5,7 @@ import io
 import logging
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramNetworkError, TelegramNotFound, TelegramUnauthorizedError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -318,7 +319,18 @@ async def main() -> None:
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
-    log.info("Бот запущен. Модель: %s, качество: %s", config.image_model, config.image_quality)
+    try:
+        me = await bot.get_me()
+    except (TelegramNotFound, TelegramUnauthorizedError):
+        await bot.session.close()
+        raise SystemExit(
+            "Telegram не принял BOT_TOKEN. Проверьте токен в файле .env: "
+            "@BotFather → /mybots → ваш бот → API Token."
+        )
+    except TelegramNetworkError as e:
+        await bot.session.close()
+        raise SystemExit(f"Нет связи с Telegram, проверьте интернет или VPN. ({e})")
+    log.info("Бот @%s запущен. Модель: %s, качество: %s", me.username, config.image_model, config.image_quality)
     await dp.start_polling(bot)
 
 
