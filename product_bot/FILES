@@ -5,6 +5,7 @@ generator.py
 infographic.py
 art_director.py
 style_library.py
+access.py
 updater.py
 requirements.txt
 start.sh

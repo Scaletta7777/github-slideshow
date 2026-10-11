@@ -1,6 +1,7 @@
 """Telegram-бот: фото товара -> профессиональная карточка для маркетплейса (OpenAI Images API)."""
 
 import asyncio
+import html
 import io
 import logging
 import os
@@ -15,6 +16,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Update
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeChat,
     BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
@@ -28,6 +30,7 @@ from openai import OpenAIError
 from PIL import Image
 
 import infographic
+import access
 import style_library
 import updater
 from art_director import ArtDirector
@@ -92,9 +95,87 @@ async def only_allowed(handler, event: TelegramObject, data: dict):
                 "Впишите его в ALLOWED_USER_IDS в файле .env и перезапустите бота."
             )
         return None
-    if user is None or user.id not in config.allowed_user_ids:
-        return None  # чужим молча не отвечаем
-    return await handler(event, data)
+    if user is None:
+        return None
+    if is_admin(user.id) or user.id in access.load():
+        return await handler(event, data)
+    if isinstance(event, Message):
+        await request_access(event, user)
+    return None
+
+
+def is_admin(user_id: int) -> bool:
+    """Владельцы — те, чьи ID вписаны в ALLOWED_USER_IDS. Остальных они пускают из Telegram."""
+    return user_id in config.allowed_user_ids
+
+
+access_requests: dict[int, str] = {}  # кто ждёт решения владельца: id -> имя
+
+
+async def request_access(message: Message, user) -> None:
+    name = user.full_name + (f" (@{user.username})" if user.username else "")
+    if user.id in access_requests:
+        await message.answer("⏳ Запрос уже у владельца бота, подождите его решения.")
+        return
+    access_requests[user.id] = name
+    await message.answer("🔒 Это закрытый бот. Я отправил владельцу запрос на доступ — "
+                         "как только он разрешит, я напишу вам.")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Разрешить", callback_data=f"acc:ok:{user.id}")
+    kb.button(text="❌ Отклонить", callback_data=f"acc:no:{user.id}")
+    for admin in config.allowed_user_ids:
+        try:
+            await message.bot.send_message(
+                admin, f"👤 <b>{html.escape(name)}</b> (ID <code>{user.id}</code>) просит доступ к боту.\n"
+                       "Генерации будут оплачиваться с вашего ключа OpenAI.",
+                reply_markup=kb.as_markup())
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось отправить запрос доступа владельцу %s", admin)
+
+
+@router.callback_query(F.data.startswith("acc:"))
+async def decide_access(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("Только владелец может это сделать")
+        return
+    _, action, raw_id = call.data.split(":")
+    user_id = int(raw_id)
+    name = access_requests.pop(user_id, None) or access.load().get(user_id) or str(user_id)
+    if action == "ok":
+        access.add(user_id, name)
+        await call.message.edit_text(f"✅ Доступ выдан: {html.escape(name)}. Отозвать — /users")
+        await notify(call.bot, user_id, "✅ Владелец открыл вам доступ! Пришлите фото товара — начнём. "
+                                        "Подсказка: /start")
+    elif action == "no":
+        await call.message.edit_text(f"❌ Запрос отклонён: {html.escape(name)}")
+        await notify(call.bot, user_id, "❌ Владелец отклонил запрос на доступ.")
+    elif action == "rm":
+        access.remove(user_id)
+        await call.message.edit_text(f"🚫 Доступ отозван: {html.escape(name)}")
+        await notify(call.bot, user_id, "🚫 Владелец закрыл вам доступ к боту.")
+    await call.answer()
+
+
+async def notify(bot: Bot, user_id: int, text: str) -> None:
+    try:
+        await bot.send_message(user_id, text)
+    except Exception:  # noqa: BLE001
+        log.warning("Не удалось написать пользователю %s", user_id)
+
+
+@router.message(Command("users"))
+async def cmd_users(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    users = access.load()
+    if not users:
+        await message.answer("Кроме вас, доступа ни у кого нет. Новый человек просто пишет боту, "
+                             "и вам приходит запрос с кнопкой «Разрешить».")
+        return
+    for user_id, name in users.items():
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🚫 Отозвать доступ", callback_data=f"acc:rm:{user_id}")
+        await message.answer(f"👤 {html.escape(name)} — ID <code>{user_id}</code>", reply_markup=kb.as_markup())
 
 
 # ---------- клавиатуры ----------
@@ -296,9 +377,10 @@ async def start(message: Message, state: FSMContext) -> None:
         "Потом можно добавить инфографику с вашим текстом.\n\n"
         "🖼 /ref — прислать референс и фото товара: бот повторит стиль\n"
         "📌 /addstyle — научить бота стилю: пришлите карточку-образец, которая нравится\n"
-        "📋 /styles — сохранённые образцы\n"
-        "⬇️ /update — обновить бота с GitHub\n"
-        "🔄 /restart — перезапустить бота"
+        "📋 /styles — сохранённые образцы"
+        + ("\n\n<b>Для владельца:</b>\n👥 /users — кто имеет доступ\n"
+           "⬇️ /update — обновить бота с GitHub\n🔄 /restart — перезапустить бота"
+           if is_admin(message.from_user.id) else "")
     )
 
 
@@ -412,6 +494,9 @@ async def cmd_resend(message: Message) -> None:
 
 @router.message(Command("restart"))
 async def cmd_restart(message: Message, state: FSMContext, event_update: Update) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer("Перезапуск доступен только владельцу бота.")
+        return
     await state.clear()
     await message.answer("🔄 Перезапускаю бота…")
     await _schedule_restart(message, event_update)
@@ -419,6 +504,9 @@ async def cmd_restart(message: Message, state: FSMContext, event_update: Update)
 
 @router.message(Command("update"))
 async def cmd_update(message: Message, state: FSMContext, event_update: Update) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer("Обновление доступно только владельцу бота.")
+        return
     status = await message.answer("⬇️ Проверяю обновления на GitHub…")
     try:
         changed = await updater.fetch_updates()
@@ -790,15 +878,24 @@ async def main() -> None:
     except TelegramNetworkError as e:
         await bot.session.close()
         raise SystemExit(f"Нет связи с Telegram, проверьте интернет или VPN. ({e})")
-    await bot.set_my_commands([
+    commands = [
         BotCommand(command="start", description="Начать / помощь"),
         BotCommand(command="ref", description="Карточка по референсу"),
         BotCommand(command="addstyle", description="Добавить образец дизайна"),
         BotCommand(command="styles", description="Мои образцы"),
         BotCommand(command="resend", description="Прислать последние результаты ещё раз"),
+    ]
+    admin_commands = commands + [
+        BotCommand(command="users", description="Кто имеет доступ"),
         BotCommand(command="update", description="Обновить бота"),
         BotCommand(command="restart", description="Перезапустить бота"),
-    ])
+    ]
+    await bot.set_my_commands(commands)
+    for admin in config.allowed_user_ids:
+        try:
+            await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin))
+        except Exception:  # noqa: BLE001
+            log.warning("Не удалось задать меню команд для %s", admin)
     log.info("Бот @%s запущен. Модель: %s, качество: %s", me.username, config.image_model, config.image_quality)
     if chat := os.environ.pop("BOT_RESTARTED_CHAT", None):
         try:
