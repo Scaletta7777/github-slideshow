@@ -54,14 +54,64 @@ BASE_PROMPT = (
     "free space around it. Do not add any text, captions, watermarks or logos that are not on the product."
 )
 
-AI_INFOGRAPHIC_PROMPT = (
-    "Turn this product photo into a professional marketplace product card with infographics. "
-    "Keep the product and the scene exactly as they are. Add a clean, modern infographic layout: "
-    "a bold headline, and the features as neat callouts/badges with simple icons placed so they do not cover the product. "
-    "Use EXACTLY this text, spelled character by character, in the same language, without adding other words:\n"
-    "Headline: {title}\n"
-    "Features:\n{features}"
+# Стили ИИ-инфографики: (название на кнопке, описание дизайна для модели)
+INFO_STYLES: dict[str, tuple[str, str]] = {
+    "minimal": (
+        "◻️ Минимализм",
+        "minimal premium style like Apple product pages: one large clean bold sans-serif headline centered "
+        "at the top, a small light subtitle under it, lots of empty space, no boxes or panels",
+    ),
+    "editorial": (
+        "🖋 Элегантный",
+        "elegant editorial style: a refined serif headline, thin hairline leader lines with tiny captions "
+        "pointing to real details of the product, muted natural palette, airy composition",
+    ),
+    "bold": (
+        "🅱️ Журнальный",
+        "bold fashion-magazine cover style: a huge heavy condensed uppercase headline across the top, "
+        "a short punchy tagline, and a vertical list of small thin-line icons with short uppercase captions",
+    ),
+    "badges": (
+        "🏷 Яркие бейджи",
+        "friendly marketplace style: rounded pill-shaped badges in soft bright colors matching the photo, "
+        "each with a simple white icon and short text, placed in the corners, rounded modern font",
+    ),
+}
+
+INFOGRAPHIC_PROMPT = (
+    "You are a top marketplace product-card designer. Turn this product photo into a high-converting, "
+    "magazine-quality main gallery image for a marketplace (Wildberries, Ozon, Amazon).\n"
+    "PRODUCT: keep the product itself IDENTICAL: the same shape, proportions, colors, materials, textures, "
+    "logos, labels and printed text. Do not redraw, restyle or replace it.\n"
+    "LAYOUT: you may recompose, extend or simplify the background and move or scale the product to free clean "
+    "space for typography; text must never overlap the product. The photo stays realistic and high-end.\n"
+    "DESIGN STYLE: {style}.\n"
+    "TYPOGRAPHY: one dominant headline (very large, 1-4 words), an optional short subtitle, and at most "
+    "2-4 short feature callouts. Strong visual hierarchy, generous margins, precise alignment, crisp perfectly "
+    "legible text, a cohesive color palette taken from the photo, consistent thin-line icons. No clutter, "
+    "no extra words, no prices, no watermarks, no invented brand logos.\n"
+    "{text}"
 )
+
+USER_TEXT = (
+    "TEXT: use EXACTLY this text, spelled character by character, in the language it is written in, "
+    "without adding other words. Shorten nothing.\nHeadline: {title}\n{features}"
+)
+
+AUTO_TEXT = (
+    "TEXT: write the copy yourself in {language}: a catchy headline of 1-3 words that names the product, "
+    "an optional subtitle of up to 5 words, and 2-3 benefit callouts of 2-4 words each. Only claim what is "
+    "plausible from the photo. Spell everything correctly."
+)
+
+
+def build_infographic_prompt(style_key: str, title: str | None, features: list[str], language: str) -> str:
+    if title:
+        lines = "\n".join(f"- {f}" for f in features)
+        text = USER_TEXT.format(title=title, features=f"Features:\n{lines}" if lines else "")
+    else:
+        text = AUTO_TEXT.format(language=language)
+    return INFOGRAPHIC_PROMPT.format(style=INFO_STYLES[style_key][1], text=text)
 
 EDIT_PROMPT = (
     "Edit this product photo according to the request below. Change only what is asked; keep the product itself "

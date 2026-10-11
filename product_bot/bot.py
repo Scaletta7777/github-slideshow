@@ -3,6 +3,7 @@
 import asyncio
 import io
 import logging
+import random
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramNetworkError, TelegramNotFound, TelegramUnauthorizedError
@@ -23,7 +24,7 @@ from openai import OpenAIError
 from PIL import Image
 
 import infographic
-from concepts import AI_INFOGRAPHIC_PROMPT, CONCEPTS, EDIT_PROMPT, build_prompt
+from concepts import CONCEPTS, EDIT_PROMPT, INFO_STYLES, build_infographic_prompt, build_prompt
 from config import load_config
 from generator import ASPECTS, ImageGenerator, prepare_input, to_jpeg
 
@@ -94,6 +95,21 @@ def result_kb():
     return kb.as_markup()
 
 
+def info_styles_kb():
+    kb = InlineKeyboardBuilder()
+    for key, (title, _) in INFO_STYLES.items():
+        kb.button(text=title, callback_data=f"is:{key}")
+    kb.button(text="🎲 3 разных стиля сразу", callback_data="is:mix")
+    kb.adjust(2, 2, 1)
+    return kb.as_markup()
+
+
+def auto_text_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✨ Придумай текст сам", callback_data="it:auto")
+    return kb.as_markup()
+
+
 # ---------- вспомогательное ----------
 
 async def download(bot: Bot, file_id: str) -> bytes:
@@ -117,12 +133,13 @@ async def send_results(message: Message, images: list[Image.Image], caption: str
         await message.answer_document(BufferedInputFile(f, f"card_{i}.jpg"), caption=label, reply_markup=result_kb())
 
 
-async def run_generation(message: Message, state: FSMContext, user_id: int, prompt: str, caption: str,
-                         file_id: str | None = None, variants: int | None = None) -> None:
-    """file_id — исходник (по умолчанию загруженное фото товара); variants — сколько картинок сгенерировать."""
+async def run_generation(message: Message, state: FSMContext, user_id: int, prompt: str | list[str],
+                         caption: str, file_id: str | None = None, variants: int | None = None) -> None:
+    """file_id — исходник (по умолчанию загруженное фото товара); variants — сколько картинок сгенерировать.
+    Если prompt — список, по каждому промпту генерируется одна картинка (параллельно)."""
     data = await state.get_data()
     file_id = file_id or data.get("src_id")
-    variants = variants or data.get("variants", 1)
+    variants = len(prompt) if isinstance(prompt, list) else (variants or data.get("variants", 1))
     if not file_id:
         await message.answer("Сначала пришлите фото товара 📷")
         return
@@ -137,7 +154,11 @@ async def run_generation(message: Message, state: FSMContext, user_id: int, prom
     try:
         async with ChatActionSender.upload_photo(bot=message.bot, chat_id=message.chat.id):
             raw = prepare_input(await download(message.bot, file_id))
-            images = await generator.edit(raw, prompt, aspect, n=variants)
+            if isinstance(prompt, list):
+                batches = await asyncio.gather(*(generator.edit(raw, p, aspect) for p in prompt))
+                images = [img for batch in batches for img in batch]
+            else:
+                images = await generator.edit(raw, prompt, aspect, n=variants)
         await send_results(message, images, caption)
     except OpenAIError as e:
         log.exception("OpenAI error")
@@ -251,14 +272,50 @@ async def again(call: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("info:"))
 async def ask_infographic(call: CallbackQuery, state: FSMContext) -> None:
     mode = call.data.split(":", 1)[1]
-    await state.set_state(Flow.infographic_text)
     await state.update_data(info_mode=mode, info_base=call.message.document.file_id)
-    await call.message.answer(
-        "Пришлите текст для карточки. <b>Первая строка — заголовок</b>, остальные — преимущества "
-        f"(до {infographic.MAX_FEATURES}), например:\n\n"
-        "<code>Платье из льна\n100% натуральный лён\nНе мнётся\nРазмеры 42–54</code>"
-    )
     await call.answer()
+    if mode == "ai":
+        await state.set_state(None)
+        await call.message.answer("Выберите стиль оформления:", reply_markup=info_styles_kb())
+        return
+    await state.set_state(Flow.infographic_text)
+    await call.message.answer(TEXT_HINT)
+
+
+TEXT_HINT = (
+    "Пришлите текст для карточки. <b>Первая строка — заголовок</b>, остальные — преимущества "
+    f"(до {infographic.MAX_FEATURES}). Чем короче, тем красивее, например:\n\n"
+    "<code>Льняное платье\n100% лён\nНе мнётся\nРазмеры 42–54</code>"
+)
+
+
+@router.callback_query(F.data.startswith("is:"))
+async def pick_info_style(call: CallbackQuery, state: FSMContext) -> None:
+    style = call.data[3:]
+    await state.update_data(info_style=style)
+    await state.set_state(Flow.infographic_text)
+    await call.answer()
+    await call.message.answer(TEXT_HINT + "\n\nИли пусть бот придумает текст сам:", reply_markup=auto_text_kb())
+
+
+async def run_ai_infographic(message: Message, state: FSMContext, user_id: int,
+                             title: str | None, features: list[str]) -> None:
+    data = await state.get_data()
+    style = data.get("info_style", "mix")
+    styles = random.sample(list(INFO_STYLES), 3) if style not in INFO_STYLES else [style]
+    prompts = [build_infographic_prompt(s, title, features, config.card_language) for s in styles]
+    caption = "✨ " + " · ".join(INFO_STYLES[s][0] for s in styles)
+    await run_generation(message, state, user_id, prompts, caption, file_id=data["info_base"])
+
+
+@router.callback_query(F.data == "it:auto")
+async def auto_text(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(None)
+    await call.answer()
+    if not (await state.get_data()).get("info_base"):
+        await call.message.answer("Нет готовой картинки — сначала сгенерируйте фото товара.")
+        return
+    await run_ai_infographic(call.message, state, call.from_user.id, None, [])
 
 
 @router.message(Flow.infographic_text, F.text)
@@ -271,11 +328,7 @@ async def got_infographic(message: Message, state: FSMContext) -> None:
         return
 
     if data.get("info_mode") == "ai":
-        prompt = AI_INFOGRAPHIC_PROMPT.format(
-            title=title, features="\n".join(f"- {f}" for f in features) or "-"
-        )
-        await run_generation(message, state, message.from_user.id, prompt, "✨ Инфографика (ИИ)",
-                             file_id=data["info_base"], variants=1)
+        await run_ai_infographic(message, state, message.from_user.id, title or None, features)
         return
 
     raw = await download(message.bot, data["info_base"])

@@ -19,6 +19,7 @@ class Config:
     image_model: str
     image_quality: str
     font_path: str | None
+    card_language: str
 
 
 def load_config() -> Config:
@@ -38,4 +39,5 @@ def load_config() -> Config:
         image_model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2").strip(),
         image_quality=os.getenv("OPENAI_IMAGE_QUALITY", "high").strip(),
         font_path=os.getenv("FONT_PATH", "").strip() or None,
+        card_language=os.getenv("CARD_LANGUAGE", "Russian").strip() or "Russian",
     )
