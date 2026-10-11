@@ -3,7 +3,6 @@
 import asyncio
 import io
 import logging
-import random
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramNetworkError, TelegramNotFound, TelegramUnauthorizedError
@@ -11,6 +10,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BotCommand,
     BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
@@ -24,15 +24,28 @@ from openai import OpenAIError
 from PIL import Image
 
 import infographic
-from concepts import CONCEPTS, EDIT_PROMPT, INFO_STYLES, build_infographic_prompt, build_prompt
+import style_library
+from art_director import ArtDirector
+from concepts import (
+    AUTO_TEXT,
+    CONCEPTS,
+    EDIT_PROMPT,
+    INFO_STYLES,
+    REFERENCE_AUTO_TEXT,
+    REFERENCE_CARD_PROMPT,
+    build_infographic_prompt,
+    build_prompt,
+    exact_text,
+)
 from config import load_config
-from generator import ASPECTS, ImageGenerator, prepare_input, to_jpeg
+from generator import ASPECTS, ImageGenerator, prepare_input, to_jpeg, to_preview_jpeg
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("product_bot")
 
 config = load_config()
 generator = ImageGenerator(config.openai_api_key, config.image_model, config.image_quality)
+director = ArtDirector(generator.client, config.text_model)
 router = Router()
 busy: set[int] = set()
 
@@ -41,6 +54,9 @@ class Flow(StatesGroup):
     custom_scene = State()
     infographic_text = State()
     edit_text = State()
+    add_style = State()
+    ref_card = State()
+    ref_product = State()
 
 
 VARIANT_CHOICES = (1, 2, 4)
@@ -97,10 +113,14 @@ def result_kb():
 
 def info_styles_kb():
     kb = InlineKeyboardBuilder()
+    kb.button(text="🤖 ИИ подберёт стиль", callback_data="is:auto1")
+    kb.button(text="🤖 ИИ: 3 варианта", callback_data="is:auto3")
     for key, (title, _) in INFO_STYLES.items():
         kb.button(text=title, callback_data=f"is:{key}")
-    kb.button(text="🎲 3 разных стиля сразу", callback_data="is:mix")
-    kb.adjust(2, 2, 1)
+    refs = style_library.load()
+    for ref in refs:
+        kb.button(text=f"📌 {ref['name']}", callback_data=f"is:{ref['id']}")
+    kb.adjust(2, 2, 2, *([2] * ((len(refs) + 1) // 2)))
     return kb.as_markup()
 
 
@@ -133,10 +153,13 @@ async def send_results(message: Message, images: list[Image.Image], caption: str
         await message.answer_document(BufferedInputFile(f, f"card_{i}.jpg"), caption=label, reply_markup=result_kb())
 
 
-async def run_generation(message: Message, state: FSMContext, user_id: int, prompt: str | list[str],
+Job = tuple[str, list[bytes]]  # (промпт, картинки-образцы)
+
+
+async def run_generation(message: Message, state: FSMContext, user_id: int, prompt: str | list[Job],
                          caption: str, file_id: str | None = None, variants: int | None = None) -> None:
     """file_id — исходник (по умолчанию загруженное фото товара); variants — сколько картинок сгенерировать.
-    Если prompt — список, по каждому промпту генерируется одна картинка (параллельно)."""
+    Если prompt — список заданий, по каждому генерируется одна картинка (параллельно)."""
     data = await state.get_data()
     file_id = file_id or data.get("src_id")
     variants = len(prompt) if isinstance(prompt, list) else (variants or data.get("variants", 1))
@@ -155,7 +178,9 @@ async def run_generation(message: Message, state: FSMContext, user_id: int, prom
         async with ChatActionSender.upload_photo(bot=message.bot, chat_id=message.chat.id):
             raw = prepare_input(await download(message.bot, file_id))
             if isinstance(prompt, list):
-                batches = await asyncio.gather(*(generator.edit(raw, p, aspect) for p in prompt))
+                batches = await asyncio.gather(
+                    *(generator.edit(raw, p, aspect, references=refs) for p, refs in prompt)
+                )
                 images = [img for batch in batches for img in batch]
             else:
                 images = await generator.edit(raw, prompt, aspect, n=variants)
@@ -183,8 +208,122 @@ async def start(message: Message, state: FSMContext) -> None:
     await message.answer(
         "👋 Пришлите фото товара (можно с телефона, лучше <b>файлом</b> — так качество выше).\n\n"
         "Дальше выберите концепт — получите профессиональную карточку для маркетплейса. "
-        "Потом можно добавить инфографику с вашим текстом."
+        "Потом можно добавить инфографику с вашим текстом.\n\n"
+        "🖼 /ref — прислать референс и фото товара: бот повторит стиль\n"
+        "📌 /addstyle — научить бота стилю: пришлите карточку-образец, которая нравится\n"
+        "📋 /styles — сохранённые образцы"
     )
+
+
+# ---------- библиотека образцов ----------
+
+@router.message(Command("addstyle"))
+async def ask_style_sample(message: Message, state: FSMContext) -> None:
+    await state.set_state(Flow.add_style)
+    await message.answer(
+        "Пришлите карточку-образец, дизайн которой вам нравится (фото или файлом): "
+        "с Aidentika, маркетплейса, Pinterest. Бот запомнит стиль и будет делать карточки «как этот»."
+    )
+
+
+@router.message(Flow.add_style, F.photo)
+@router.message(Flow.add_style, F.document.mime_type.startswith("image/"))
+async def got_style_sample(message: Message, state: FSMContext) -> None:
+    await state.set_state(None)
+    file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    status = await message.answer("🧠 Изучаю дизайн образца…")
+    try:
+        jpeg = to_preview_jpeg(await download(message.bot, file_id), side=1536)
+        desc = await director.describe(jpeg)
+        ref = style_library.add(desc.name, desc.description, jpeg)
+    except Exception as e:  # noqa: BLE001
+        log.exception("Style sample failed")
+        await status.edit_text(f"❌ Не получилось: {e}")
+        return
+    await status.edit_text(
+        f"📌 Стиль «{ref['name']}» сохранён. Он появится в выборе стилей инфографики, "
+        "а ИИ-арт-директор будет предлагать его, когда он подходит товару.\n"
+        "Добавить ещё — /addstyle, список и удаление — /styles"
+    )
+
+
+@router.message(Command("ref"))
+async def ask_reference(message: Message, state: FSMContext) -> None:
+    await state.set_state(Flow.ref_card)
+    await message.answer(
+        "🖼 <b>Карточка по референсу</b>\n\n"
+        "<b>Шаг 1 из 2.</b> Пришлите референс — карточку, стиль которой нужно повторить "
+        "(скриншот с маркетплейса, Aidentika, Pinterest)."
+    )
+
+
+@router.message(Flow.ref_card, F.photo)
+@router.message(Flow.ref_card, F.document.mime_type.startswith("image/"))
+async def got_reference(message: Message, state: FSMContext) -> None:
+    file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    await state.update_data(ref_file=file_id, ref_notes=None, ref_name=None)
+    await state.set_state(Flow.ref_product)
+    kb = None
+    if (await state.get_data()).get("src_id"):
+        b = InlineKeyboardBuilder()
+        b.button(text="Взять последнее фото товара", callback_data="ref:last")
+        kb = b.as_markup()
+    await message.answer("<b>Шаг 2 из 2.</b> Теперь пришлите фото товара (лучше файлом).", reply_markup=kb)
+
+
+async def _ref_ask_text(message: Message, state: FSMContext, product_file: str) -> None:
+    await state.update_data(info_base=product_file, src_id=product_file, info_mode="ai", info_style="oneoff")
+    await state.set_state(Flow.infographic_text)
+    await message.answer(TEXT_HINT + "\n\nИли пусть бот напишет свой текст в духе референса:",
+                         reply_markup=auto_text_kb())
+
+
+@router.message(Flow.ref_product, F.photo)
+@router.message(Flow.ref_product, F.document.mime_type.startswith("image/"))
+async def got_ref_product(message: Message, state: FSMContext) -> None:
+    file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    await _ref_ask_text(message, state, file_id)
+
+
+@router.callback_query(Flow.ref_product, F.data == "ref:last")
+async def ref_use_last(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await _ref_ask_text(call.message, state, (await state.get_data())["src_id"])
+
+
+@router.callback_query(F.data == "save_ref")
+async def save_reference(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if not data.get("ref_file") or not data.get("ref_notes"):
+        await call.answer("Референс уже недоступен")
+        return
+    jpeg = to_preview_jpeg(await download(call.bot, data["ref_file"]), side=1536)
+    ref = style_library.add(data.get("ref_name") or "Мой референс", data["ref_notes"], jpeg)
+    await call.answer("Сохранено")
+    await call.message.edit_text(f"📌 Стиль «{ref['name']}» сохранён — он есть в выборе стилей инфографики.")
+
+
+@router.message(Command("styles"))
+async def list_styles(message: Message) -> None:
+    refs = style_library.load()
+    if not refs:
+        await message.answer("Сохранённых образцов пока нет. Добавьте: /addstyle")
+        return
+    kb = InlineKeyboardBuilder()
+    for ref in refs:
+        kb.button(text=f"🗑 {ref['name']}", callback_data=f"rs:{ref['id']}")
+    kb.adjust(1)
+    await message.answer(
+        "Ваши образцы:\n" + "\n".join(f"📌 {r['name']}" for r in refs) + "\n\nНажмите, чтобы удалить:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("rs:"))
+async def remove_style(call: CallbackQuery) -> None:
+    style_library.remove(call.data[3:])
+    await call.answer("Удалено")
+    await call.message.delete()
 
 
 @router.message(F.photo)
@@ -234,7 +373,7 @@ async def pick_concept(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer("Неизвестный концепт")
         return
     prompt = build_prompt(key)
-    await state.update_data(prompt=prompt, caption=CONCEPTS[key][0])
+    await state.update_data(prompt=prompt, caption=CONCEPTS[key][0], last_kind="concept")
     await call.answer()
     await run_generation(call.message, state, call.from_user.id, prompt, CONCEPTS[key][0])
 
@@ -253,7 +392,7 @@ async def ask_custom(call: CallbackQuery, state: FSMContext) -> None:
 async def got_custom(message: Message, state: FSMContext) -> None:
     await state.set_state(None)
     prompt = build_prompt(None, custom_scene=message.text)
-    await state.update_data(prompt=prompt, caption="✍️ Свой сценарий")
+    await state.update_data(prompt=prompt, caption="✍️ Свой сценарий", last_kind="concept")
     await run_generation(message, state, message.from_user.id, prompt, "✍️ Свой сценарий")
 
 
@@ -261,6 +400,10 @@ async def got_custom(message: Message, state: FSMContext) -> None:
 async def again(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     await call.answer()
+    if data.get("last_kind") == "info":  # повторяем последнюю инфографику / карточку по референсу
+        await run_ai_infographic(call.message, state, call.from_user.id,
+                                 data.get("last_title"), data.get("last_features", []))
+        return
     if not data.get("prompt"):
         await call.message.answer("Сначала выберите концепт.")
         return
@@ -301,11 +444,63 @@ async def pick_info_style(call: CallbackQuery, state: FSMContext) -> None:
 async def run_ai_infographic(message: Message, state: FSMContext, user_id: int,
                              title: str | None, features: list[str]) -> None:
     data = await state.get_data()
-    style = data.get("info_style", "mix")
-    styles = random.sample(list(INFO_STYLES), 3) if style not in INFO_STYLES else [style]
-    prompts = [build_infographic_prompt(s, title, features, config.card_language) for s in styles]
-    caption = "✨ " + " · ".join(INFO_STYLES[s][0] for s in styles)
-    await run_generation(message, state, user_id, prompts, caption, file_id=data["info_base"])
+    style = data.get("info_style", "auto1")
+    text = exact_text(title, features) if title else AUTO_TEXT.format(language=config.card_language)
+
+    await state.update_data(last_kind="info", last_title=title, last_features=features)
+
+    if style == "oneoff":  # /ref: разовый референс
+        status = await message.answer("🧠 Изучаю референс…")
+        try:
+            ref_jpeg = to_preview_jpeg(await download(message.bot, data["ref_file"]), side=1536)
+            notes = data.get("ref_notes")
+            if not notes:
+                desc = await director.describe(ref_jpeg)
+                notes = desc.description
+                await state.update_data(ref_notes=notes, ref_name=desc.name)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Reference analysis failed")
+            await status.edit_text(f"❌ Не получилось разобрать референс: {e}")
+            return
+        await status.delete()
+        ref_text = text if title else REFERENCE_AUTO_TEXT.format(language=config.card_language)
+        prompt = REFERENCE_CARD_PROMPT.format(notes=notes, text=ref_text)
+        jobs = [(prompt, [ref_jpeg])] * data.get("variants", 1)
+        await run_generation(message, state, user_id, jobs, "🖼 По референсу", file_id=data["info_base"])
+        kb = InlineKeyboardBuilder()
+        kb.button(text="📌 Запомнить этот стиль", callback_data="save_ref")
+        await message.answer("Понравился стиль? Сохраните его, чтобы применять к другим товарам.",
+                             reply_markup=kb.as_markup())
+        return
+
+    if style in INFO_STYLES:
+        jobs = [(build_infographic_prompt(INFO_STYLES[style][1], text), [])]
+        caption = "✨ " + INFO_STYLES[style][0]
+    elif ref := style_library.get(style):
+        jobs = [(build_infographic_prompt(ref["description"], text, with_reference=True),
+                 [style_library.image(ref["id"])])]
+        caption = f"📌 По образцу «{ref['name']}»"
+    else:  # auto1 / auto3 — решает арт-директор
+        count = 3 if style == "auto3" else 1
+        status = await message.answer("🧠 Арт-директор изучает товар и подбирает дизайн…")
+        try:
+            preview = to_preview_jpeg(await download(message.bot, data["info_base"]))
+            user_text = "\n".join([title, *features]) if title else None
+            result = await director.plan(preview, count, config.card_language, user_text, style_library.load())
+        except Exception as e:  # noqa: BLE001
+            log.exception("Art director failed")
+            await status.edit_text(f"❌ Арт-директор не справился: {e}")
+            return
+        jobs = []
+        for plan in result.plans:
+            plan_text = text if title else exact_text(plan.headline, plan.callouts, plan.subtitle)
+            ref = style_library.get(plan.style_key)
+            jobs.append((build_infographic_prompt(plan.design_brief, plan_text, with_reference=bool(ref)),
+                         [style_library.image(ref["id"])] if ref else []))
+        names = " · ".join(p.style_name for p in result.plans)
+        await status.edit_text(f"🧠 Товар: {result.product}\nДизайн: {names}")
+        caption = f"🤖 {names}"
+    await run_generation(message, state, user_id, jobs, caption, file_id=data["info_base"])
 
 
 @router.callback_query(F.data == "it:auto")
@@ -383,6 +578,12 @@ async def main() -> None:
     except TelegramNetworkError as e:
         await bot.session.close()
         raise SystemExit(f"Нет связи с Telegram, проверьте интернет или VPN. ({e})")
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Начать / помощь"),
+        BotCommand(command="ref", description="Карточка по референсу"),
+        BotCommand(command="addstyle", description="Добавить образец дизайна"),
+        BotCommand(command="styles", description="Мои образцы"),
+    ])
     log.info("Бот @%s запущен. Модель: %s, качество: %s", me.username, config.image_model, config.image_quality)
     await dp.start_polling(bot)
 

@@ -81,21 +81,23 @@ INFO_STYLES: dict[str, tuple[str, str]] = {
 INFOGRAPHIC_PROMPT = (
     "You are a top marketplace product-card designer. Turn this product photo into a high-converting, "
     "magazine-quality main gallery image for a marketplace (Wildberries, Ozon, Amazon).\n"
+    "{reference}"
     "PRODUCT: keep the product itself IDENTICAL: the same shape, proportions, colors, materials, textures, "
     "logos, labels and printed text. Do not redraw, restyle or replace it.\n"
     "LAYOUT: you may recompose, extend or simplify the background and move or scale the product to free clean "
     "space for typography; text must never overlap the product. The photo stays realistic and high-end.\n"
-    "DESIGN STYLE: {style}.\n"
-    "TYPOGRAPHY: one dominant headline (very large, 1-4 words), an optional short subtitle, and at most "
+    "DESIGN: {style}\n"
+    "TYPOGRAPHY: one dominant headline (very large), an optional short subtitle, and at most "
     "2-4 short feature callouts. Strong visual hierarchy, generous margins, precise alignment, crisp perfectly "
     "legible text, a cohesive color palette taken from the photo, consistent thin-line icons. No clutter, "
     "no extra words, no prices, no watermarks, no invented brand logos.\n"
     "{text}"
 )
 
-USER_TEXT = (
-    "TEXT: use EXACTLY this text, spelled character by character, in the language it is written in, "
-    "without adding other words. Shorten nothing.\nHeadline: {title}\n{features}"
+REFERENCE_NOTE = (
+    "IMAGES: the FIRST image is the product photo to use. The SECOND image is only a DESIGN REFERENCE: reproduce "
+    "its layout, typography, colors, badge shapes and overall feel as closely as possible, but do NOT copy its "
+    "product, its words or its logos.\n"
 )
 
 AUTO_TEXT = (
@@ -105,13 +107,46 @@ AUTO_TEXT = (
 )
 
 
-def build_infographic_prompt(style_key: str, title: str | None, features: list[str], language: str) -> str:
-    if title:
-        lines = "\n".join(f"- {f}" for f in features)
-        text = USER_TEXT.format(title=title, features=f"Features:\n{lines}" if lines else "")
-    else:
-        text = AUTO_TEXT.format(language=language)
-    return INFOGRAPHIC_PROMPT.format(style=INFO_STYLES[style_key][1], text=text)
+def exact_text(title: str, features: list[str], subtitle: str = "") -> str:
+    lines = [f"Headline: {title}"]
+    if subtitle:
+        lines.append(f"Subtitle: {subtitle}")
+    if features:
+        lines.append("Callouts:\n" + "\n".join(f"- {f}" for f in features))
+    return (
+        "TEXT: use EXACTLY this text, spelled character by character, in the language it is written in, "
+        "without adding other words:\n" + "\n".join(lines)
+    )
+
+
+def build_infographic_prompt(style: str, text: str, with_reference: bool = False) -> str:
+    """style — описание дизайна; text — exact_text(...) или AUTO_TEXT; with_reference — передан образец."""
+    return INFOGRAPHIC_PROMPT.format(
+        style=style, text=text, reference=REFERENCE_NOTE if with_reference else ""
+    )
+
+
+REFERENCE_CARD_PROMPT = (
+    "Create a marketplace product card. The FIRST image is the seller's product photo. The SECOND image is a "
+    "reference card whose design must be reproduced as closely as possible.\n"
+    "COPY FROM THE REFERENCE: overall composition and product placement, camera angle, background type, colors "
+    "and props, lighting and shadows, typography (font style, weight, case, size, position), text blocks and "
+    "badges (shapes, colors, icons, positions), decorative elements and overall mood. "
+    "Reference design notes: {notes}\n"
+    "REPLACE THE PRODUCT: put the product from the FIRST image where the reference product is, keeping our "
+    "product IDENTICAL (shape, proportions, colors, materials, logos, labels, printed text). Never copy the "
+    "reference product, its brand name or its logos.\n"
+    "{text}\n"
+    "The result must look like the next card of the same series by the same designer: photorealistic, "
+    "crisp perfectly legible text."
+)
+
+REFERENCE_AUTO_TEXT = (
+    "TEXT: replace the reference wording with new copy for OUR product in {language}, keeping the same number of "
+    "text elements and similar length as in the reference. Only claim what is plausible from the photo. "
+    "Spell everything correctly."
+)
+
 
 EDIT_PROMPT = (
     "Edit this product photo according to the request below. Change only what is asked; keep the product itself "

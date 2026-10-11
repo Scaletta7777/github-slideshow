@@ -59,6 +59,13 @@ def _fit_aspect(img: Image.Image, aspect: str) -> Image.Image:
     return ImageOps.fit(img, size, method=Image.LANCZOS)
 
 
+def to_preview_jpeg(raw: bytes, side: int = 1024) -> bytes:
+    """Уменьшенная JPEG-копия для анализа текстовой нейросетью."""
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw)))
+    img.thumbnail((side, side))
+    return to_jpeg(img, quality=88)
+
+
 def to_jpeg(img: Image.Image, quality: int = 95) -> bytes:
     out = io.BytesIO()
     img.convert("RGB").save(out, format="JPEG", quality=quality, optimize=True)
@@ -71,11 +78,16 @@ class ImageGenerator:
         self.model = model
         self.quality = quality
 
-    async def edit(self, image_png: bytes, prompt: str, aspect: str, n: int = 1) -> list[Image.Image]:
+    async def edit(self, image_png: bytes, prompt: str, aspect: str, n: int = 1,
+                   references: list[bytes] | None = None) -> list[Image.Image]:
+        """references — дополнительные картинки (образцы дизайна), идут после фото товара."""
         extra = {"input_fidelity": "high"} if _supports_input_fidelity(self.model) else {}
+        image = ("product.png", image_png, "image/png")
+        if references:
+            image = [image] + [(f"reference_{i}.jpg", ref, "image/jpeg") for i, ref in enumerate(references, 1)]
         result = await self.client.images.edit(
             model=self.model,
-            image=("product.png", image_png, "image/png"),
+            image=image,
             prompt=prompt,
             size=_request_size(self.model, aspect),
             quality=self.quality,
