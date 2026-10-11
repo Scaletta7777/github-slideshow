@@ -28,6 +28,14 @@ def load_config() -> Config:
     key = os.getenv("OPENAI_API_KEY", "").strip().strip("\"'«»“”")
     if not token or not key:
         raise SystemExit("Заполните BOT_TOKEN и OPENAI_API_KEY в файле .env (см. .env.example)")
+    # при вставке из Терминала к ключу иногда прилипает мусор («s:sk-proj-…») — отрезаем всё до «sk-»
+    if m := re.search(r"sk-[\w-]{20,}", key):
+        key = m.group(0)
+    else:
+        raise SystemExit("OPENAI_API_KEY в файле .env должен начинаться с sk-. Проверьте ключ на platform.openai.com")
+    # то же для токена: он начинается с цифр бота
+    if m := re.search(r"\d{5,}:[\w-]{30,}", token):
+        token = m.group(0)
     if not re.fullmatch(r"\d{5,}:[\w-]{30,}", token) or token.startswith("123456789:"):
         raise SystemExit(
             "BOT_TOKEN в файле .env выглядит неправильно. Он должен быть вида 7712345678:AAH... "
