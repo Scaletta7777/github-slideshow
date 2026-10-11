@@ -1,0 +1,5 @@
+aiogram>=3.31,<4
+openai>=3.28
+pillow>=11
+pillow-heif>=0.18
+python-dotenv>=1.0
