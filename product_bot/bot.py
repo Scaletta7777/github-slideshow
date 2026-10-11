@@ -4,6 +4,8 @@ import asyncio
 import io
 import logging
 import os
+import time
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramNetworkError, TelegramNotFound, TelegramUnauthorizedError
@@ -148,28 +150,69 @@ def auto_text_kb():
 
 # ---------- вспомогательное ----------
 
+OUTPUT_DIR = Path(__file__).parent / "output"
+SEND_TIMEOUT = 180  # секунд на запрос к Telegram (отправка больших файлов)
+RETRY_DELAY = 3
+last_results: dict[int, tuple[list[bytes], str, int]] = {}  # chat_id -> (файлы, подпись, first_slide) для /resend
+
+
+async def tg_retry(make_call, tries: int = 3):
+    """Повторяет запрос к Telegram при сетевых сбоях (таймаут, обрыв связи)."""
+    for attempt in range(1, tries + 1):
+        try:
+            return await make_call()
+        except TelegramNetworkError:
+            if attempt == tries:
+                raise
+            log.warning("Telegram network error, retry %d/%d", attempt, tries - 1)
+            await asyncio.sleep(RETRY_DELAY * attempt)
+
+
 async def download(bot: Bot, file_id: str) -> bytes:
-    buf = io.BytesIO()
-    await bot.download(file_id, destination=buf)
-    return buf.getvalue()
+    async def call() -> bytes:
+        buf = io.BytesIO()
+        await bot.download(file_id, destination=buf, timeout=120)
+        return buf.getvalue()
+    return await tg_retry(call)
 
 
-async def send_results(message: Message, images: list[Image.Image], caption: str, first_slide: int = 0) -> None:
+def save_outputs(files: list[bytes]) -> Path:
+    """Каждая готовая картинка сохраняется на диск — за неё уже заплачено, терять нельзя."""
+    folder = OUTPUT_DIR / time.strftime("%Y-%m-%d")
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%H%M%S")
+    for i, f in enumerate(files, 1):
+        (folder / f"{stamp}_{i}.jpg").write_bytes(f)
+    return folder
+
+
+async def send_files(message: Message, files: list[bytes], caption: str, first_slide: int = 0) -> None:
     """Превью фото + файл в полном качестве с кнопками. Кнопки работают с файлом, к которому прикреплены."""
-    files = [to_jpeg(img) for img in images]
     if len(files) == 1:
-        await message.answer_photo(BufferedInputFile(files[0], "card.jpg"), caption=caption)
+        await tg_retry(lambda: message.answer_photo(
+            BufferedInputFile(files[0], "card.jpg"), caption=caption))
     else:
-        await message.answer_media_group([
+        await tg_retry(lambda: message.answer_media_group([
             InputMediaPhoto(media=BufferedInputFile(f, f"card_{i}.jpg"), caption=caption if i == 1 else None)
             for i, f in enumerate(files, 1)
-        ])
+        ]))
     for i, f in enumerate(files, 1):
         if first_slide:
             label = f"Слайд {first_slide + i - 1} — файл в полном качестве"
         else:
             label = f"Вариант {i} — файл в полном качестве" if len(files) > 1 else "Файл в полном качестве"
-        await message.answer_document(BufferedInputFile(f, f"card_{i}.jpg"), caption=label, reply_markup=result_kb())
+        await tg_retry(lambda: message.answer_document(
+            BufferedInputFile(f, f"card_{i}.jpg"), caption=label, reply_markup=result_kb()))
+
+
+async def send_results(message: Message, images: list[Image.Image], caption: str, first_slide: int = 0) -> None:
+    files = [to_jpeg(img) for img in images]
+    last_results[message.chat.id] = (files, caption, first_slide)
+    try:
+        save_outputs(files)
+    except OSError:
+        log.exception("Не удалось сохранить картинки на диск")
+    await send_files(message, files, caption, first_slide)
 
 
 Job = tuple[str, list[bytes]]  # (промпт, картинки-образцы)
@@ -177,7 +220,7 @@ Job = tuple[str, list[bytes]]  # (промпт, картинки-образцы)
 
 async def run_generation(message: Message, state: FSMContext, user_id: int, prompt: str | list[Job],
                          caption: str, file_id: str | None = None, variants: int | None = None,
-                         first_slide: int = 0) -> None:
+                         first_slide: int = 0) -> bool:
     """file_id — исходник (по умолчанию загруженное фото товара); variants — сколько картинок сгенерировать.
     Если prompt — список заданий, по каждому генерируется одна картинка (параллельно)."""
     data = await state.get_data()
@@ -185,10 +228,10 @@ async def run_generation(message: Message, state: FSMContext, user_id: int, prom
     variants = len(prompt) if isinstance(prompt, list) else (variants or data.get("variants", 1))
     if not file_id:
         await message.answer("Сначала пришлите фото товара 📷")
-        return
+        return False
     if user_id in busy:
         await message.answer("⏳ Уже генерирую, подождите…")
-        return
+        return False
     busy.add(user_id)
     aspect = data.get("aspect", "3:4")
     forms = ("слайд", "слайда", "слайдов") if first_slide else ("вариант", "варианта", "вариантов")
@@ -218,6 +261,14 @@ async def run_generation(message: Message, state: FSMContext, user_id: int, prom
             else:
                 images = await generator.edit(raw, prompt, aspect, n=variants)
         await send_results(message, images, caption, first_slide)
+        return True
+    except TelegramNetworkError as e:
+        log.exception("Telegram send failed")
+        if message.chat.id in last_results:  # картинки готовы и сохранены, не дошла только отправка
+            await message.answer(f"⚠️ Картинки готовы, но Telegram не принял файл ({e}). "
+                                 "Ничего не потеряно — нажмите /resend, чтобы получить их снова.")
+        else:
+            await message.answer(f"❌ Нет связи с Telegram: {e}. Попробуйте ещё раз.")
     except OpenAIError as e:
         log.exception("OpenAI error")
         await message.answer(f"❌ Ошибка OpenAI: {e}")
@@ -230,6 +281,7 @@ async def run_generation(message: Message, state: FSMContext, user_id: int, prom
             await status.delete()
         except Exception:  # noqa: BLE001
             pass
+    return False
 
 
 # ---------- команды и фото ----------
@@ -343,6 +395,19 @@ async def save_reference(call: CallbackQuery, state: FSMContext) -> None:
 async def _schedule_restart(message: Message, event_update: Update) -> None:
     restart_request.update(chat=message.chat.id, offset=event_update.update_id + 1)
     await dp.stop_polling()
+
+
+@router.message(Command("resend"))
+async def cmd_resend(message: Message) -> None:
+    if message.chat.id not in last_results:
+        await message.answer("Нет последних результатов (они хранятся до перезапуска бота). "
+                             "Все картинки также сохраняются на сервере в папке output/.")
+        return
+    files, caption, first_slide = last_results[message.chat.id]
+    try:
+        await send_files(message, files, caption, first_slide)
+    except TelegramNetworkError as e:
+        await message.answer(f"❌ Telegram снова не принял файл: {e}. Попробуйте /resend чуть позже.")
 
 
 @router.message(Command("restart"))
@@ -535,7 +600,8 @@ async def run_ai_infographic(message: Message, state: FSMContext, user_id: int,
         ref_text = text if title else REFERENCE_AUTO_TEXT.format(language=config.card_language)
         prompt = REFERENCE_CARD_PROMPT.format(notes=notes, text=ref_text)
         jobs = [(prompt, [ref_jpeg])] * data.get("variants", 1)
-        await run_generation(message, state, user_id, jobs, "🖼 По референсу", file_id=data["info_base"])
+        if not await run_generation(message, state, user_id, jobs, "🖼 По референсу", file_id=data["info_base"]):
+            return
         kb = InlineKeyboardBuilder()
         kb.button(text="📌 Запомнить этот стиль", callback_data="save_ref")
         await message.answer("Понравился стиль? Сохраните его, чтобы применять к другим товарам.",
@@ -708,7 +774,10 @@ async def main() -> None:
     from aiogram.client.default import DefaultBotProperties
     from aiogram.enums import ParseMode
 
-    bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    from aiogram.client.session.aiohttp import AiohttpSession
+
+    bot = Bot(config.bot_token, session=AiohttpSession(timeout=SEND_TIMEOUT),
+              default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp.include_router(router)
     try:
         me = await bot.get_me()
@@ -726,6 +795,7 @@ async def main() -> None:
         BotCommand(command="ref", description="Карточка по референсу"),
         BotCommand(command="addstyle", description="Добавить образец дизайна"),
         BotCommand(command="styles", description="Мои образцы"),
+        BotCommand(command="resend", description="Прислать последние результаты ещё раз"),
         BotCommand(command="update", description="Обновить бота"),
         BotCommand(command="restart", description="Перезапустить бота"),
     ])
