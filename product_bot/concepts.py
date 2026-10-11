@@ -90,7 +90,8 @@ INFOGRAPHIC_PROMPT = (
     "TYPOGRAPHY: one dominant headline (very large), an optional short subtitle, and at most "
     "2-4 short feature callouts. Strong visual hierarchy, generous margins, precise alignment, crisp perfectly "
     "legible text, a cohesive color palette taken from the photo, consistent thin-line icons. No clutter, "
-    "no extra words, no prices, no watermarks, no invented brand logos.\n"
+    "no extra words, no watermarks, no invented brand logos. FORBIDDEN (marketplaces ban it): phone numbers, "
+    "addresses, websites, emails, social media handles, QR codes, prices, discounts, store names.\n"
     "{text}"
 )
 
@@ -136,15 +137,18 @@ REFERENCE_CARD_PROMPT = (
     "REPLACE THE PRODUCT: put the product from the FIRST image where the reference product is, keeping our "
     "product IDENTICAL (shape, proportions, colors, materials, logos, labels, printed text). Never copy the "
     "reference product, its brand name or its logos.\n"
+    "FORBIDDEN (marketplaces ban it): phone numbers, addresses, websites, emails, social media handles, "
+    "QR codes, prices, discounts, store names and contact blocks. If the reference has such a block, replace it "
+    "with product benefits in the same visual style or leave that area clean. Never invent facts.\n"
     "{text}\n"
     "The result must look like the next card of the same series by the same designer: photorealistic, "
     "crisp perfectly legible text."
 )
 
 REFERENCE_AUTO_TEXT = (
-    "TEXT: replace the reference wording with new copy for OUR product in {language}, keeping the same number of "
-    "text elements and similar length as in the reference. Only claim what is plausible from the photo. "
-    "Spell everything correctly."
+    "TEXT: replace the reference wording with new copy for OUR product in {language}, keeping a similar "
+    "number of text elements and similar length as in the reference, but at most one headline, one subtitle and "
+    "4 short benefit callouts. Only claim what is plausible from the photo. Spell everything correctly."
 )
 
 

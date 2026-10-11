@@ -39,7 +39,8 @@ design_brief: a concrete brief for the designer, in English, 60-120 words, cover
 - graphic elements: badges, pills, thin leader lines, icons (style and size), dividers;
 - background treatment: keep, simplify, extend, recolor.
 Design the way the best Wildberries/Ozon sellers and Aidentika do: few words, big confident headline, \
-strong hierarchy, premium look, everything readable on a phone screen.
+strong hierarchy, premium look, everything readable on a phone screen. Never put phone numbers, addresses, \
+websites, social handles, QR codes, prices or store names on the card (marketplaces ban them).
 
 Available styles:
 {styles}
@@ -57,7 +58,8 @@ callouts = the rest, subtitle empty) and design around it:
 DESCRIBE_INSTRUCTIONS = """This image is a product card the seller likes. Describe its DESIGN so that another \
 designer can reproduce the same style for a different product: layout, typography (font character, weight, \
 case, sizes), color palette (hex), graphic elements (badges, lines, icons), background treatment, overall mood. \
-Ignore the specific product and the specific words. 60-120 words, in English."""
+Ignore the specific product and the specific words. Do not describe contact blocks (phones, addresses, \
+websites) or prices: they must not be reproduced. 60-120 words, in English."""
 
 
 def _image_input(jpeg: bytes) -> dict:
