@@ -101,3 +101,64 @@ class ArtDirector:
             text_format=StyleDescription,
         )
         return resp.output_parsed
+
+
+class Slide(BaseModel):
+    role: str = Field(description="назначение слайда по-русски, 1-3 слова (например «Детали», «Размеры»)")
+    scene: str = Field(description="what the slide shows: composition, camera, props, in English")
+    design_brief: str = Field(description="layout and graphic elements of this slide, in English")
+    headline: str
+    subtitle: str
+    callouts: list[str]
+
+
+class Series(BaseModel):
+    product: str = Field(description="что за товар, по-русски")
+    slides: list[Slide]
+
+
+SERIES_INSTRUCTIONS = """You are the art director of a studio that makes top-selling marketplace listings \
+(Wildberries, Ozon, Amazon). The FIRST image is the product photo, the SECOND image is the cover card of its \
+gallery. Plan {count} MORE gallery slides that continue the cover in the same design system and together sell \
+the product: each slide has its own job and a clearly different composition.
+
+Pick the most useful slide jobs for THIS product, for example: key benefits with icons; close-up of texture and \
+details; product in use / lifestyle with a person or interior; dimensions and sizes; materials and composition; \
+how to use or care; what is in the box; color options; comparison "why us"; gift idea. Do not repeat the cover.
+
+For each slide write:
+- role: its job in Russian (1-3 words);
+- scene: what the image shows (composition, camera angle, props, how the product is placed), in English;
+- design_brief: where the text and graphic elements go, in English, consistent with the cover's fonts, colors, \
+badge shapes and icon style;
+- copy in {language}: headline 1-4 words, subtitle up to 6 words (may be empty), 0-4 callouts of 2-5 words.
+
+Facts: {facts}
+Never put phone numbers, addresses, websites, social handles, QR codes, prices or store names on slides."""
+
+FACTS_GIVEN = """use ONLY these facts from the seller for numbers, sizes, materials and specifications, never \
+invent other numbers:
+{info}"""
+
+FACTS_NONE = """the seller gave no specifications, so do not invent numbers, sizes, percentages or certificates; \
+use only what is visible (texture, look, usage) and skip slides that need exact data (like a size chart)."""
+
+
+async def _plan_series(director: "ArtDirector", product_jpeg: bytes, cover_jpeg: bytes, count: int,
+                      language: str, info: str | None) -> Series:
+    facts = FACTS_GIVEN.format(info=info) if info else FACTS_NONE
+    text = SERIES_INSTRUCTIONS.format(count=count, language=language, facts=facts)
+    resp = await director.client.responses.parse(
+        model=director.model,
+        input=[{"role": "user", "content": [{"type": "input_text", "text": text},
+                                            _image_input(product_jpeg), _image_input(cover_jpeg)]}],
+        text_format=Series,
+    )
+    result = resp.output_parsed
+    if not result or not result.slides:
+        raise RuntimeError("арт-директор не предложил ни одного слайда")
+    result.slides = result.slides[:count]
+    return result
+
+
+ArtDirector.plan_series = _plan_series

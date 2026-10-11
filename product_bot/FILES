@@ -1,0 +1,14 @@
+bot.py
+concepts.py
+config.py
+generator.py
+infographic.py
+art_director.py
+style_library.py
+updater.py
+requirements.txt
+start.sh
+start.bat
+.env.example
+README.md
+FILES

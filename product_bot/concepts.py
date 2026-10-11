@@ -152,6 +152,21 @@ REFERENCE_AUTO_TEXT = (
 )
 
 
+SERIES_SLIDE_PROMPT = (
+    "Create slide {index} of {total} of a marketplace product gallery. The FIRST image is the product photo. "
+    "The SECOND image is the gallery cover: keep EXACTLY the same design system (fonts, colors, badge and "
+    "icon style, background mood, overall premium look) so the slides look like one series.\n"
+    "This slide's job: {role}.\n"
+    "SCENE: {scene}\n"
+    "LAYOUT: {brief}\n"
+    "PRODUCT: keep it IDENTICAL to the first image (shape, proportions, colors, materials, logos, labels, "
+    "printed text); text never overlaps it.\n"
+    "{text}\n"
+    "FORBIDDEN: phone numbers, addresses, websites, social handles, QR codes, prices, store names. "
+    "Photorealistic, crisp perfectly legible text."
+)
+
+
 EDIT_PROMPT = (
     "Edit this product photo according to the request below. Change only what is asked; keep the product itself "
     "exactly the same (shape, colors, materials, logos, labels, printed text) unless the request is explicitly "

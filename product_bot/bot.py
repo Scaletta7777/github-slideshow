@@ -3,12 +3,14 @@
 import asyncio
 import io
 import logging
+import os
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramNetworkError, TelegramNotFound, TelegramUnauthorizedError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Update
 from aiogram.types import (
     BotCommand,
     BufferedInputFile,
@@ -25,8 +27,10 @@ from PIL import Image
 
 import infographic
 import style_library
+import updater
 from art_director import ArtDirector
 from concepts import (
+    SERIES_SLIDE_PROMPT,
     AUTO_TEXT,
     CONCEPTS,
     EDIT_PROMPT,
@@ -47,6 +51,8 @@ config = load_config()
 generator = ImageGenerator(config.openai_api_key, config.image_model, config.image_quality)
 director = ArtDirector(generator.client, config.text_model)
 router = Router()
+dp = Dispatcher()
+restart_request: dict = {}  # {"chat": id, "offset": update_id + 1} — выставляется /restart и /update
 busy: set[int] = set()
 
 
@@ -54,12 +60,21 @@ class Flow(StatesGroup):
     custom_scene = State()
     infographic_text = State()
     edit_text = State()
+    series_info = State()
     add_style = State()
     ref_card = State()
     ref_product = State()
 
 
-VARIANT_CHOICES = (1, 2, 4)
+VARIANT_CHOICES = (1, 2, 4, 8)
+SERIES_CHOICES = (3, 5, 7)  # сколько слайдов добавить к обложке
+MAX_PARALLEL = 3  # одновременных запросов к OpenAI, чтобы не упереться в лимиты
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    return few if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else many
 
 
 # ---------- доступ только для своих ----------
@@ -106,8 +121,9 @@ def result_kb():
     kb.button(text="🔁 Ещё вариант", callback_data="again")
     kb.button(text="🅰️ Инфографика (точный текст)", callback_data="info:tpl")
     kb.button(text="✨ Инфографика (ИИ-дизайн)", callback_data="info:ai")
+    kb.button(text="📚 Серия слайдов (до 8 фото)", callback_data="series")
     kb.button(text="🎨 Другой концепт", callback_data="concepts")
-    kb.adjust(2, 1, 1, 1)
+    kb.adjust(2, 1, 1, 1, 1)
     return kb.as_markup()
 
 
@@ -138,7 +154,7 @@ async def download(bot: Bot, file_id: str) -> bytes:
     return buf.getvalue()
 
 
-async def send_results(message: Message, images: list[Image.Image], caption: str) -> None:
+async def send_results(message: Message, images: list[Image.Image], caption: str, first_slide: int = 0) -> None:
     """Превью фото + файл в полном качестве с кнопками. Кнопки работают с файлом, к которому прикреплены."""
     files = [to_jpeg(img) for img in images]
     if len(files) == 1:
@@ -149,7 +165,10 @@ async def send_results(message: Message, images: list[Image.Image], caption: str
             for i, f in enumerate(files, 1)
         ])
     for i, f in enumerate(files, 1):
-        label = f"Вариант {i} — файл в полном качестве" if len(files) > 1 else "Файл в полном качестве"
+        if first_slide:
+            label = f"Слайд {first_slide + i - 1} — файл в полном качестве"
+        else:
+            label = f"Вариант {i} — файл в полном качестве" if len(files) > 1 else "Файл в полном качестве"
         await message.answer_document(BufferedInputFile(f, f"card_{i}.jpg"), caption=label, reply_markup=result_kb())
 
 
@@ -157,7 +176,8 @@ Job = tuple[str, list[bytes]]  # (промпт, картинки-образцы)
 
 
 async def run_generation(message: Message, state: FSMContext, user_id: int, prompt: str | list[Job],
-                         caption: str, file_id: str | None = None, variants: int | None = None) -> None:
+                         caption: str, file_id: str | None = None, variants: int | None = None,
+                         first_slide: int = 0) -> None:
     """file_id — исходник (по умолчанию загруженное фото товара); variants — сколько картинок сгенерировать.
     Если prompt — список заданий, по каждому генерируется одна картинка (параллельно)."""
     data = await state.get_data()
@@ -171,20 +191,33 @@ async def run_generation(message: Message, state: FSMContext, user_id: int, prom
         return
     busy.add(user_id)
     aspect = data.get("aspect", "3:4")
-    status = await message.answer(
-        "⏳ Генерирую" + (f" {variants} варианта" if variants > 1 else "") + ", обычно это 30–90 секунд…"
-    )
+    forms = ("слайд", "слайда", "слайдов") if first_slide else ("вариант", "варианта", "вариантов")
+    what = f" {variants} {plural(variants, *forms)}" if variants > 1 else ""
+    wait = "обычно это 30–90 секунд" if variants <= 2 else "это займёт 2–5 минут"
+    status = await message.answer(f"⏳ Генерирую{what}, {wait}…")
     try:
         async with ChatActionSender.upload_photo(bot=message.bot, chat_id=message.chat.id):
             raw = prepare_input(await download(message.bot, file_id))
             if isinstance(prompt, list):
-                batches = await asyncio.gather(
-                    *(generator.edit(raw, p, aspect, references=refs) for p, refs in prompt)
-                )
+                sem, done = asyncio.Semaphore(MAX_PARALLEL), 0
+
+                async def one(p: str, refs: list[bytes]) -> list[Image.Image]:
+                    nonlocal done
+                    async with sem:
+                        result = await generator.edit(raw, p, aspect, references=refs)
+                    done += 1
+                    if len(prompt) > 2:
+                        try:
+                            await status.edit_text(f"⏳ Готово {done} из {len(prompt)}…")
+                        except Exception:  # noqa: BLE001
+                            pass
+                    return result
+
+                batches = await asyncio.gather(*(one(p, refs) for p, refs in prompt))
                 images = [img for batch in batches for img in batch]
             else:
                 images = await generator.edit(raw, prompt, aspect, n=variants)
-        await send_results(message, images, caption)
+        await send_results(message, images, caption, first_slide)
     except OpenAIError as e:
         log.exception("OpenAI error")
         await message.answer(f"❌ Ошибка OpenAI: {e}")
@@ -211,7 +244,9 @@ async def start(message: Message, state: FSMContext) -> None:
         "Потом можно добавить инфографику с вашим текстом.\n\n"
         "🖼 /ref — прислать референс и фото товара: бот повторит стиль\n"
         "📌 /addstyle — научить бота стилю: пришлите карточку-образец, которая нравится\n"
-        "📋 /styles — сохранённые образцы"
+        "📋 /styles — сохранённые образцы\n"
+        "⬇️ /update — обновить бота с GitHub\n"
+        "🔄 /restart — перезапустить бота"
     )
 
 
@@ -301,6 +336,40 @@ async def save_reference(call: CallbackQuery, state: FSMContext) -> None:
     ref = style_library.add(data.get("ref_name") or "Мой референс", data["ref_notes"], jpeg)
     await call.answer("Сохранено")
     await call.message.edit_text(f"📌 Стиль «{ref['name']}» сохранён — он есть в выборе стилей инфографики.")
+
+
+# ---------- перезапуск и обновление ----------
+
+async def _schedule_restart(message: Message, event_update: Update) -> None:
+    restart_request.update(chat=message.chat.id, offset=event_update.update_id + 1)
+    await dp.stop_polling()
+
+
+@router.message(Command("restart"))
+async def cmd_restart(message: Message, state: FSMContext, event_update: Update) -> None:
+    await state.clear()
+    await message.answer("🔄 Перезапускаю бота…")
+    await _schedule_restart(message, event_update)
+
+
+@router.message(Command("update"))
+async def cmd_update(message: Message, state: FSMContext, event_update: Update) -> None:
+    status = await message.answer("⬇️ Проверяю обновления на GitHub…")
+    try:
+        changed = await updater.fetch_updates()
+        if "requirements.txt" in changed:
+            await status.edit_text("📦 Устанавливаю новые библиотеки…")
+            await updater.install_requirements()
+    except Exception as e:  # noqa: BLE001
+        log.exception("Update failed")
+        await status.edit_text(f"❌ Не удалось обновиться: {e}")
+        return
+    if not changed:
+        await status.edit_text("✅ У вас уже последняя версия.")
+        return
+    await status.edit_text("✅ Обновлено: " + ", ".join(changed) + "\n🔄 Перезапускаю бота…")
+    await state.clear()
+    await _schedule_restart(message, event_update)
 
 
 @router.message(Command("styles"))
@@ -533,6 +602,81 @@ async def got_infographic(message: Message, state: FSMContext) -> None:
     await send_results(message, [img], "🅰️ Инфографика")
 
 
+# ---------- серия слайдов ----------
+
+@router.callback_query(F.data == "series")
+async def ask_series_count(call: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(series_cover=call.message.document.file_id)
+    kb = InlineKeyboardBuilder()
+    for n in SERIES_CHOICES:
+        kb.button(text=f"+{n} → всего {n + 1} фото", callback_data=f"ser:{n}")
+    kb.adjust(1)
+    await call.answer()
+    await call.message.answer(
+        "📚 Эта карточка станет обложкой, а бот сделает к ней слайды в том же стиле: преимущества, детали, "
+        "товар в использовании, размеры, состав… Сколько слайдов добавить?\n"
+        "<i>Каждый слайд — отдельная генерация.</i>",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("ser:"))
+async def ask_series_info(call: CallbackQuery, state: FSMContext) -> None:
+    arg = call.data[4:]
+    await call.answer()
+    if arg == "auto":
+        await state.set_state(None)
+        await run_series(call.message, state, call.from_user.id, None)
+        return
+    await state.update_data(series_count=int(arg))
+    await state.set_state(Flow.series_info)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✨ Без характеристик, придумай сам", callback_data="ser:auto")
+    await call.message.answer(
+        "Пришлите характеристики товара одним сообщением: размеры, состав, плотность, комплектация, уход… "
+        "Бот возьмёт цифры <b>только</b> отсюда и ничего не выдумает. Например:\n\n"
+        "<code>Размер 50×100 и 70×140\n100% хлопок, 500 г/м²\nСтирка при 40°\nЦвета: графит, бежевый, белый</code>",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.message(Flow.series_info, F.text)
+async def got_series_info(message: Message, state: FSMContext) -> None:
+    await state.set_state(None)
+    await run_series(message, state, message.from_user.id, message.text)
+
+
+async def run_series(message: Message, state: FSMContext, user_id: int, info: str | None) -> None:
+    data = await state.get_data()
+    cover_id = data.get("series_cover")
+    product_id = data.get("src_id") or cover_id
+    count = data.get("series_count", SERIES_CHOICES[-1])
+    if not cover_id:
+        await message.answer("Нажмите «📚 Серия слайдов» под готовой карточкой.")
+        return
+    status = await message.answer(f"🧠 Арт-директор планирует серию из {count} слайдов…")
+    try:
+        product_jpeg = to_preview_jpeg(await download(message.bot, product_id))
+        cover_jpeg = to_preview_jpeg(await download(message.bot, cover_id), side=1536)
+        series = await director.plan_series(product_jpeg, cover_jpeg, count, config.card_language, info)
+    except Exception as e:  # noqa: BLE001
+        log.exception("Series planning failed")
+        await status.edit_text(f"❌ Арт-директор не справился: {e}")
+        return
+    total = len(series.slides)
+    await status.edit_text(
+        f"🧠 {series.product}. План серии:\n"
+        + "\n".join(f"{i}. {s.role}" for i, s in enumerate(series.slides, 2))
+    )
+    jobs = [
+        (SERIES_SLIDE_PROMPT.format(index=i, total=total + 1, role=s.role, scene=s.scene, brief=s.design_brief,
+                                    text=exact_text(s.headline, s.callouts, s.subtitle)), [cover_jpeg])
+        for i, s in enumerate(series.slides, 2)
+    ]
+    caption = f"📚 Серия: {', '.join(s.role for s in series.slides)}"
+    await run_generation(message, state, user_id, jobs, caption[:1000], file_id=product_id, first_slide=2)
+
+
 # ---------- доработка текстом ----------
 
 @router.callback_query(F.data == "edit")
@@ -565,7 +709,6 @@ async def main() -> None:
     from aiogram.enums import ParseMode
 
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher()
     dp.include_router(router)
     try:
         me = await bot.get_me()
@@ -583,9 +726,22 @@ async def main() -> None:
         BotCommand(command="ref", description="Карточка по референсу"),
         BotCommand(command="addstyle", description="Добавить образец дизайна"),
         BotCommand(command="styles", description="Мои образцы"),
+        BotCommand(command="update", description="Обновить бота"),
+        BotCommand(command="restart", description="Перезапустить бота"),
     ])
     log.info("Бот @%s запущен. Модель: %s, качество: %s", me.username, config.image_model, config.image_quality)
+    if chat := os.environ.pop("BOT_RESTARTED_CHAT", None):
+        try:
+            await bot.send_message(int(chat), "✅ Бот перезапущен и готов к работе.")
+        except Exception:  # noqa: BLE001
+            log.warning("Не удалось отправить сообщение о перезапуске")
     await dp.start_polling(bot)
+    if restart_request:
+        # подтверждаем команду /restart, иначе Telegram пришлёт её снова и бот уйдёт в цикл перезапусков
+        await bot.get_updates(offset=restart_request["offset"], timeout=0)
+        await bot.session.close()
+        log.info("Перезапуск…")
+        updater.restart_process(restart_request["chat"])
 
 
 if __name__ == "__main__":
